@@ -1,0 +1,1 @@
+cargo:rustc-env=MIME_TYPES_GENERATED_PATH=E:\TelegramBOT\target\debug\build\mime_guess/086debca1ce0c396\out\mime_types_generated.rs
