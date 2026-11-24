@@ -1,6 +1,4 @@
 //! Telegram bot commands.
-//!
-//! Uses `teloxide`'s `BotCommands` derive to declare each supported command.
 
 use teloxide::utils::command::BotCommands;
 
@@ -28,4 +26,16 @@ pub enum Command {
 
     #[command(description = "Mostrar el estado de la suscripción.")]
     Status,
+
+    #[command(description = "[Admin] Listar suscritos y bloqueados.")]
+    Users,
+
+    #[command(description = "[Admin] Suscribir usuario por ID: /adduser <id>")]
+    Adduser(String),
+
+    #[command(description = "[Admin] Eliminar y bloquear usuario por ID: /deluser <id>")]
+    Deluser(String),
+
+    #[command(description = "[Admin] Desbloquear usuario por ID: /unban <id>")]
+    Unban(String),
 }

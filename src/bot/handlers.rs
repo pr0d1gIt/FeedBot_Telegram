@@ -1,8 +1,4 @@
 //! Telegram message handlers and digest rendering helpers.
-//!
-//! The handlers convert incoming commands into bot actions, while the
-//! [`render_digest`] / [`send_digest`] helpers are reused by both the
-//! `/latest` command and the periodic scheduler.
 
 use crate::aggregator::Aggregator;
 use crate::bot::commands::Command;
@@ -10,15 +6,97 @@ use crate::models::{CategorisedItem, Category};
 use crate::persistence::State;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use teloxide::prelude::*;
 use teloxide::types::{LinkPreviewOptions, ParseMode};
+use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-/// Telegram hard limit on message size (in characters). We keep a small margin.
+/// Telegram hard limit on message size (in characters).
 const TELEGRAM_MAX_CHARS: usize = 4000;
 
+/// Minimum time a non-admin user must wait between `/latest` requests.
+const LATEST_COOLDOWN: Duration = Duration::from_secs(15);
+
+/// Minimum time between any two commands to detect rapid button/command flooding.
+const GENERAL_COOLDOWN: Duration = Duration::from_secs(2);
+
+/// Number of cooldown violations before automatically banning the user.
+const MAX_SPAM_STRIKES: u8 = 3;
+
+#[derive(Debug, Default)]
+struct UserRateEntry {
+    last_command: Option<Instant>,
+    last_latest: Option<Instant>,
+    strikes: u8,
+    warned_in_window: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RateLimiter {
+    inner: Arc<Mutex<HashMap<i64, UserRateEntry>>>,
+}
+
+enum RateDecision {
+    Allow,
+    Warn(String),
+    AutoBan,
+}
+
+impl RateLimiter {
+    async fn check(&self, chat_id: i64, is_latest: bool) -> RateDecision {
+        let mut map = self.inner.lock().await;
+        let entry = map.entry(chat_id).or_default();
+        let now = Instant::now();
+
+        if is_latest {
+            if let Some(prev) = entry.last_latest {
+                let elapsed = now.duration_since(prev);
+                if elapsed < LATEST_COOLDOWN {
+                    entry.strikes += 1;
+                    if entry.strikes >= MAX_SPAM_STRIKES {
+                        return RateDecision::AutoBan;
+                    }
+                    let remaining = (LATEST_COOLDOWN - elapsed).as_secs().max(1);
+                    return RateDecision::Warn(format!(
+                        "⏳ Espera {remaining}s antes de volver a pedir /latest. El spam repetido conlleva bloqueo automático."
+                    ));
+                }
+            }
+            entry.last_latest = Some(now);
+            entry.last_command = Some(now);
+            entry.strikes = 0;
+            entry.warned_in_window = false;
+            return RateDecision::Allow;
+        }
+
+        if let Some(prev) = entry.last_command {
+            if now.duration_since(prev) < GENERAL_COOLDOWN {
+                entry.strikes += 1;
+                if entry.strikes >= MAX_SPAM_STRIKES + 2 {
+                    return RateDecision::AutoBan;
+                }
+                if !entry.warned_in_window {
+                    entry.warned_in_window = true;
+                    return RateDecision::Warn(
+                        "⏳ Por favor, no envíes comandos tan rápido.".to_string(),
+                    );
+                }
+                return RateDecision::Warn(String::new());
+            }
+        }
+
+        entry.last_command = Some(now);
+        entry.strikes = 0;
+        entry.warned_in_window = false;
+        RateDecision::Allow
+    }
+}
+
 /// Entry point dispatched by teloxide for every incoming command.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_command(
     bot: Bot,
     msg: Message,
@@ -26,21 +104,71 @@ pub async fn handle_command(
     state: State,
     aggregator: Aggregator,
     max_items: usize,
+    admin_ids: Arc<HashSet<i64>>,
+    rate_limiter: RateLimiter,
 ) -> Result<()> {
     let chat_id = msg.chat.id;
-    info!(chat = chat_id.0, command = ?cmd, "Received command");
+    let is_admin = admin_ids.contains(&chat_id.0);
+
+    // Silently ignore banned non-admin users so they cannot consume bot resources.
+    if !is_admin && state.is_banned(chat_id.0).await {
+        warn!(chat = chat_id.0, "Ignored command from banned user");
+        return Ok(());
+    }
+
+    // Record user metadata (username / first_name) for admin listings.
+    let (username, first_name) = msg
+        .from
+        .as_ref()
+        .map(|u| (u.username.clone(), Some(u.first_name.clone())))
+        .unwrap_or((None, None));
+    let _ = state.upsert_profile(chat_id.0, username, first_name).await;
+
+    // Enforce anti-spam rate limits for non-admin users.
+    if !is_admin {
+        let is_latest = matches!(cmd, Command::Latest);
+        match rate_limiter.check(chat_id.0, is_latest).await {
+            RateDecision::Allow => {}
+            RateDecision::Warn(warning_msg) => {
+                warn!(chat = chat_id.0, command = ?cmd, "Rate limited user");
+                if !warning_msg.is_empty() {
+                    let _ = bot.send_message(chat_id, warning_msg).await;
+                }
+                return Ok(());
+            }
+            RateDecision::AutoBan => {
+                warn!(chat = chat_id.0, "Auto-banning user due to spam");
+                state.ban_user(chat_id.0).await?;
+                let label = state.user_label(chat_id.0).await;
+                let _ = bot
+                    .send_message(
+                        chat_id,
+                        "🚫 Has sido bloqueado automáticamente por uso abusivo / spam.",
+                    )
+                    .await;
+                notify_admins(
+                    &bot,
+                    &admin_ids,
+                    &format!("🚨 Usuario bloqueado automáticamente por spam:\n• {label}"),
+                )
+                .await;
+                return Ok(());
+            }
+        }
+    }
+
+    info!(chat = chat_id.0, admin = is_admin, command = ?cmd, "Received command");
 
     match cmd {
         Command::Start | Command::Help => {
-            let text = welcome_message();
+            let text = welcome_message(is_admin);
             send_markdown_v2(&bot, chat_id, &text).await?;
         }
         Command::Latest => {
-            // Acknowledge immediately because aggregation may take 10–20s.
             let _ = bot
                 .send_message(
                     chat_id,
-                    "⏳ Buscando las últimas noticias, dame unos segundos...",
+                    "⏳ Buscando las últimas publicaciones de investigación, dame unos segundos...",
                 )
                 .await;
 
@@ -49,15 +177,13 @@ pub async fn handle_command(
                 let _ = bot
                     .send_message(
                         chat_id,
-                        "⚠️ No se han podido recuperar noticias en este momento. Inténtalo de nuevo en unos minutos.",
+                        "⚠️ No se han podido recuperar publicaciones en este momento. Inténtalo de nuevo en unos minutos.",
                     )
                     .await;
                 return Ok(());
             }
 
-            // /latest does *not* deduplicate against previously sent items: the
-            // user explicitly asked, so we honour the request even with repeats.
-            send_digest(&bot, chat_id, &items, max_items, /* mark_sent: */ None).await?;
+            send_digest(&bot, chat_id, &items, max_items, None).await?;
         }
         Command::Subscribe => {
             let newly_added = state.add_subscriber(chat_id.0).await?;
@@ -91,35 +217,147 @@ pub async fn handle_command(
             );
             send_markdown_v2(&bot, chat_id, &text).await?;
         }
+        Command::Users => {
+            if !ensure_admin(&bot, chat_id, is_admin).await {
+                return Ok(());
+            }
+            let subs = state.subscribers().await;
+            let banned = state.banned_users().await;
+
+            let mut out = format!("👥 Usuarios suscritos ({}):\n", subs.len());
+            if subs.is_empty() {
+                out.push_str("  (ninguno)\n");
+            } else {
+                for id in subs {
+                    let label = state.user_label(id).await;
+                    out.push_str(&format!("  • {label}\n"));
+                }
+            }
+
+            out.push_str(&format!("\n🚫 Usuarios bloqueados ({}):\n", banned.len()));
+            if banned.is_empty() {
+                out.push_str("  (ninguno)\n");
+            } else {
+                for id in banned {
+                    let label = state.user_label(id).await;
+                    out.push_str(&format!("  • {label}\n"));
+                }
+            }
+
+            bot.send_message(chat_id, out).await?;
+        }
+        Command::Adduser(arg) => {
+            if !ensure_admin(&bot, chat_id, is_admin).await {
+                return Ok(());
+            }
+            let Some(target_id) = parse_target_id(&arg) else {
+                bot.send_message(chat_id, "Uso: /adduser <id_numerico>").await?;
+                return Ok(());
+            };
+            state.unban_user(target_id).await?;
+            let added = state.add_subscriber(target_id).await?;
+            let label = state.user_label(target_id).await;
+            let reply = if added {
+                format!("✅ Usuario añadido y suscrito: {label}")
+            } else {
+                format!("ℹ️ El usuario ya estaba suscrito (y desbloqueado si aplicaba): {label}")
+            };
+            bot.send_message(chat_id, reply).await?;
+        }
+        Command::Deluser(arg) => {
+            if !ensure_admin(&bot, chat_id, is_admin).await {
+                return Ok(());
+            }
+            let Some(target_id) = parse_target_id(&arg) else {
+                bot.send_message(chat_id, "Uso: /deluser <id_numerico>").await?;
+                return Ok(());
+            };
+            if admin_ids.contains(&target_id) {
+                bot.send_message(chat_id, "⚠️ No puedes bloquear a otro administrador.")
+                    .await?;
+                return Ok(());
+            }
+            state.ban_user(target_id).await?;
+            let label = state.user_label(target_id).await;
+            bot.send_message(
+                chat_id,
+                format!("🗑️ Usuario eliminado de suscripciones y bloqueado: {label}"),
+            )
+            .await?;
+        }
+        Command::Unban(arg) => {
+            if !ensure_admin(&bot, chat_id, is_admin).await {
+                return Ok(());
+            }
+            let Some(target_id) = parse_target_id(&arg) else {
+                bot.send_message(chat_id, "Uso: /unban <id_numerico>").await?;
+                return Ok(());
+            };
+            let unbanned = state.unban_user(target_id).await?;
+            let label = state.user_label(target_id).await;
+            let reply = if unbanned {
+                format!("🔓 Usuario desbloqueado: {label}\n(Puede volver a suscribirse con /subscribe)")
+            } else {
+                format!("ℹ️ Ese usuario no estaba en la lista de bloqueados: {label}")
+            };
+            bot.send_message(chat_id, reply).await?;
+        }
     }
 
     Ok(())
 }
 
+async fn ensure_admin(bot: &Bot, chat_id: ChatId, is_admin: bool) -> bool {
+    if !is_admin {
+        let _ = bot
+            .send_message(chat_id, "⛔ No tienes permisos para ejecutar este comando.")
+            .await;
+    }
+    is_admin
+}
+
+fn parse_target_id(raw: &str) -> Option<i64> {
+    raw.split_whitespace().next()?.parse::<i64>().ok()
+}
+
+async fn notify_admins(bot: &Bot, admin_ids: &HashSet<i64>, text: &str) {
+    for &admin_id in admin_ids {
+        let _ = bot.send_message(ChatId(admin_id), text).await;
+    }
+}
+
 /// Welcome / help text used by `/start` and `/help`.
-///
-/// Pre-escaped for Telegram MarkdownV2.
-pub fn welcome_message() -> String {
-    "*Bot de Ciberseguridad*\n\n\
-     Te mantengo al día con noticias profesionales de ciberseguridad: \
-     ataques recientes, vulnerabilidades, POCs públicos e indicadores de compromiso\\.\n\n\
+pub fn welcome_message(is_admin: bool) -> String {
+    let mut text = "*Bot de Inteligencia y Ciberseguridad*\n\n\
+     Te mantengo al día con publicaciones técnicas de equipos de investigación, CERTs y laboratorios: \
+     0\\-days, vulnerabilidades, POCs verificados e indicadores de compromiso\\.\n\n\
      *Comandos disponibles*\n\
      /latest \\– Resumen bajo demanda\\.\n\
      /subscribe \\– Recibir resúmenes automáticos cada 12 h\\.\n\
      /unsubscribe \\– Detener los resúmenes automáticos\\.\n\
      /status \\– Ver el estado de tu suscripción\\.\n\
      /help \\– Mostrar esta ayuda\\.\n\n\
-     *Fuentes*: The Hacker News, Bleeping Computer, SecurityWeek, Krebs on Security, \
-     CISA, NVD y búsqueda en GitHub \\(POCs / exploits\\)\\.\n\n\
-     ⚠️ Este bot reúne información pública\\. Verifica siempre las fuentes originales antes de actuar\\."
-        .to_string()
+     *Fuentes*: CISA, NVD, CERT/CC, INCIBE\\-CERT, Google Project Zero, PortSwigger, Trail of Bits, \
+     watchTowr, ZDI, Unit 42, Cisco Talos, Mandiant, Securelist, SentinelLabs, SANS ISC, The DFIR Report \
+     y GitHub Advisory DB\\."
+        .to_string();
+
+    if is_admin {
+        text.push_str(
+            "\n\n*Comandos de Administración*\n\
+             /users \\– Listar usuarios suscritos y bloqueados\\.\n\
+             /adduser `<id>` \\– Suscribir manualmente a un usuario\\.\n\
+             /deluser `<id>` \\– Eliminar y bloquear a un usuario\\.\n\
+             /unban `<id>` \\– Desbloquear a un usuario\\.",
+        );
+    }
+
+    text.push_str(
+        "\n\n⚠️ Este bot reúne información técnica pública\\. Verifica siempre las fuentes originales antes de actuar\\.",
+    );
+    text
 }
 
-/// Send a categorised digest to `chat_id`, splitting it into multiple messages
-/// if it exceeds Telegram's per-message size limit.
-///
-/// When `mark_sent` is `Some(state)`, items whose IDs are already in the state
-/// are filtered out and the newly delivered IDs are persisted afterwards.
 pub async fn send_digest(
     bot: &Bot,
     chat_id: ChatId,
@@ -127,7 +365,6 @@ pub async fn send_digest(
     max_items_per_category: usize,
     mark_sent: Option<&State>,
 ) -> Result<()> {
-    // Filter out already-delivered items when a state is supplied.
     let filtered: Vec<&CategorisedItem> = if let Some(state) = mark_sent {
         let mut out = Vec::with_capacity(items.len());
         for ci in items {
@@ -172,7 +409,6 @@ pub async fn send_digest(
                 part = idx + 1,
                 "Failed to send digest message; falling back to plain text"
             );
-            // Last-ditch attempt: send unformatted so the user still gets the info.
             let plain = strip_markdown(msg);
             if let Err(e2) = bot.send_message(chat_id, plain).await {
                 error!(error = %e2, "Plain-text fallback failed too; aborting digest");
@@ -193,8 +429,6 @@ pub async fn send_digest(
     Ok(())
 }
 
-/// Render a list of categorised items into one or more Telegram-MarkdownV2 strings,
-/// each at most [`TELEGRAM_MAX_CHARS`] long.
 pub fn render_digest(items: &[&CategorisedItem], max_per_category: usize) -> Vec<String> {
     let now: DateTime<Utc> = Utc::now();
     let header = format!(
@@ -202,13 +436,11 @@ pub fn render_digest(items: &[&CategorisedItem], max_per_category: usize) -> Vec
         escape_md(&now.format("%Y-%m-%d %H:%M UTC").to_string()),
     );
 
-    // Group by category, preserving the global newest-first order.
     let mut by_cat: HashMap<Category, Vec<&CategorisedItem>> = HashMap::new();
     for ci in items {
         by_cat.entry(ci.category).or_default().push(ci);
     }
 
-    // Build sections in the canonical order.
     let mut sections: Vec<String> = Vec::new();
     for cat in Category::ordered() {
         let Some(list) = by_cat.get(&cat) else {
@@ -236,7 +468,6 @@ pub fn render_digest(items: &[&CategorisedItem], max_per_category: usize) -> Vec
         return vec![format!("{header}\n_Sin novedades._")];
     }
 
-    // Pack sections into messages of at most TELEGRAM_MAX_CHARS chars.
     let mut messages = Vec::new();
     let mut current = header.clone();
     for section in sections {
@@ -275,10 +506,6 @@ fn format_item(ci: &CategorisedItem) -> String {
     line
 }
 
-/// Escape every Telegram MarkdownV2 reserved character.
-///
-/// Reserved set per the official spec:
-/// `_ * [ ] ( ) ~ \` > # + - = | { } . !`
 fn escape_md(input: &str) -> String {
     const RESERVED: &[char] = &[
         '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!',
@@ -294,8 +521,6 @@ fn escape_md(input: &str) -> String {
     out
 }
 
-/// Escape special characters that have meaning *inside* a MarkdownV2 link URL,
-/// namely `)` and `\`.
 fn escape_md_url(url: &str) -> String {
     let mut out = String::with_capacity(url.len() + 4);
     for ch in url.chars() {
@@ -307,11 +532,7 @@ fn escape_md_url(url: &str) -> String {
     out
 }
 
-/// Best-effort plain-text fallback if MarkdownV2 sending fails.
 fn strip_markdown(s: &str) -> String {
-    // Drop unambiguously-formatting characters, then normalise parens for
-    // readability. Parens are handled separately because we want them kept,
-    // just spaced out.
     let stripped: String = s
         .chars()
         .filter(|c| !matches!(c, '\\' | '*' | '_' | '[' | ']'))
@@ -327,8 +548,6 @@ fn truncate(s: &str, max_chars: usize) -> String {
     format!("{cut}…")
 }
 
-/// Send a single MarkdownV2-formatted message, with a plain-text fallback if
-/// Telegram rejects the formatting.
 async fn send_markdown_v2(bot: &Bot, chat_id: ChatId, text: &str) -> Result<()> {
     let res = bot
         .send_message(chat_id, text)
@@ -370,7 +589,6 @@ mod tests {
         let refs: Vec<&CategorisedItem> = items.iter().collect();
         let msgs = render_digest(&refs, 8);
         assert!(!msgs.is_empty());
-        // Each message must be within Telegram's hard limit.
         for m in &msgs {
             assert!(m.chars().count() <= 4096, "message exceeds Telegram limit");
         }

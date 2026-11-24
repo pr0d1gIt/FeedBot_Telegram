@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
 
     // Run the Telegram dispatcher in the foreground. Returns when the bot is
     // stopped (e.g. Ctrl-C handled by teloxide).
-    bot::run(bot, state, aggregator, config.max_items_per_category).await?;
+    bot::run(bot, state, aggregator, config.max_items_per_category, config.admin_ids).await?;
 
     info!("Shutdown complete");
     Ok(())

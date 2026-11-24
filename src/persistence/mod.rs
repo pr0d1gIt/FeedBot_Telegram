@@ -1,35 +1,43 @@
 //! Lightweight, file-backed persistence layer.
-//!
-//! The bot intentionally avoids a heavyweight database for a local
-//! deployment. State is kept in memory behind a [`tokio::sync::RwLock`] and
-//! flushed atomically to disk after every mutation.
-//!
-//! The JSON schema is intentionally simple and forward-compatible:
-//!
-//! ```json
-//! {
-//!     "subscribers": [123456789, 987654321],
-//!     "sent_ids": ["https://...", "https://..."]
-//! }
-//! ```
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-/// Upper bound on how many news IDs we remember to deduplicate. Old IDs are
-/// evicted FIFO when this limit is exceeded.
 const MAX_SENT_IDS: usize = 5000;
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserProfile {
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub first_name: Option<String>,
+}
+
+impl UserProfile {
+    pub fn display_label(&self, chat_id: i64) -> String {
+        match (&self.username, &self.first_name) {
+            (Some(u), Some(f)) => format!("{f} (@{u}) [{chat_id}]"),
+            (Some(u), None) => format!("@{u} [{chat_id}]"),
+            (None, Some(f)) => format!("{f} [{chat_id}]"),
+            (None, None) => format!("ID {chat_id}"),
+        }
+    }
+}
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct StateFile {
     #[serde(default)]
     subscribers: Vec<i64>,
+    #[serde(default)]
+    banned_users: Vec<i64>,
+    #[serde(default)]
+    user_profiles: HashMap<i64, UserProfile>,
     #[serde(default)]
     sent_ids: Vec<String>,
 }
@@ -37,9 +45,9 @@ struct StateFile {
 #[derive(Debug)]
 struct StateInner {
     subscribers: HashSet<i64>,
-    /// Order-preserving FIFO of sent IDs (oldest first).
+    banned_users: HashSet<i64>,
+    user_profiles: HashMap<i64, UserProfile>,
     sent_ids: Vec<String>,
-    /// Membership index over `sent_ids` for O(1) `contains` checks.
     sent_set: HashSet<String>,
 }
 
@@ -48,6 +56,8 @@ impl StateInner {
         let sent_set: HashSet<String> = file.sent_ids.iter().cloned().collect();
         Self {
             subscribers: file.subscribers.into_iter().collect(),
+            banned_users: file.banned_users.into_iter().collect(),
+            user_profiles: file.user_profiles,
             sent_ids: file.sent_ids,
             sent_set,
         }
@@ -56,8 +66,14 @@ impl StateInner {
     fn to_file(&self) -> StateFile {
         let mut subscribers: Vec<i64> = self.subscribers.iter().copied().collect();
         subscribers.sort_unstable();
+
+        let mut banned_users: Vec<i64> = self.banned_users.iter().copied().collect();
+        banned_users.sort_unstable();
+
         StateFile {
             subscribers,
+            banned_users,
+            user_profiles: self.user_profiles.clone(),
             sent_ids: self.sent_ids.clone(),
         }
     }
@@ -103,15 +119,53 @@ impl State {
             inner: Arc::new(RwLock::new(StateInner::from_file(file))),
             path,
         };
-        // Persist immediately so we know the path is writable.
         state.flush().await?;
         Ok(state)
+    }
+
+    /// Record or update basic user metadata when they interact with the bot.
+    pub async fn upsert_profile(
+        &self,
+        chat_id: i64,
+        username: Option<String>,
+        first_name: Option<String>,
+    ) -> Result<()> {
+        let new_profile = UserProfile {
+            username,
+            first_name,
+        };
+        let changed = {
+            let mut inner = self.inner.write().await;
+            match inner.user_profiles.get(&chat_id) {
+                Some(existing) if existing == &new_profile => false,
+                _ => {
+                    inner.user_profiles.insert(chat_id, new_profile);
+                    true
+                }
+            }
+        };
+        if changed {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    /// Get a formatted label for a user ID using stored profile metadata if available.
+    pub async fn user_label(&self, chat_id: i64) -> String {
+        let inner = self.inner.read().await;
+        inner
+            .user_profiles
+            .get(&chat_id)
+            .map(|p| p.display_label(chat_id))
+            .unwrap_or_else(|| format!("ID {chat_id}"))
     }
 
     /// Return the current list of subscriber chat ids.
     pub async fn subscribers(&self) -> Vec<i64> {
         let inner = self.inner.read().await;
-        inner.subscribers.iter().copied().collect()
+        let mut list: Vec<i64> = inner.subscribers.iter().copied().collect();
+        list.sort_unstable();
+        list
     }
 
     /// Add a subscriber. Returns `true` if the subscriber was newly added.
@@ -138,14 +192,53 @@ impl State {
         Ok(removed)
     }
 
+    /// Check whether a user is banned.
+    pub async fn is_banned(&self, chat_id: i64) -> bool {
+        let inner = self.inner.read().await;
+        inner.banned_users.contains(&chat_id)
+    }
+
+    /// Return all banned user IDs sorted.
+    pub async fn banned_users(&self) -> Vec<i64> {
+        let inner = self.inner.read().await;
+        let mut list: Vec<i64> = inner.banned_users.iter().copied().collect();
+        list.sort_unstable();
+        list
+    }
+
+    /// Ban a user and remove them from active subscribers. Returns `true` if newly banned.
+    pub async fn ban_user(&self, chat_id: i64) -> Result<bool> {
+        let changed = {
+            let mut inner = self.inner.write().await;
+            let unsub = inner.subscribers.remove(&chat_id);
+            let banned = inner.banned_users.insert(chat_id);
+            unsub || banned
+        };
+        if changed {
+            self.flush().await?;
+        }
+        Ok(changed)
+    }
+
+    /// Remove a user from the banned list. Returns `true` if they were banned.
+    pub async fn unban_user(&self, chat_id: i64) -> Result<bool> {
+        let removed = {
+            let mut inner = self.inner.write().await;
+            inner.banned_users.remove(&chat_id)
+        };
+        if removed {
+            self.flush().await?;
+        }
+        Ok(removed)
+    }
+
     /// Return true if `id` has already been delivered.
     pub async fn was_sent(&self, id: &str) -> bool {
         let inner = self.inner.read().await;
         inner.sent_set.contains(id)
     }
 
-    /// Mark the supplied IDs as delivered. The on-disk state is flushed once
-    /// after the batch is applied.
+    /// Mark the supplied IDs as delivered.
     pub async fn mark_sent_batch<I>(&self, ids: I) -> Result<()>
     where
         I: IntoIterator<Item = String>,
@@ -159,7 +252,6 @@ impl State {
                     any_added = true;
                 }
             }
-            // FIFO eviction.
             while inner.sent_ids.len() > MAX_SENT_IDS {
                 let removed = inner.sent_ids.remove(0);
                 inner.sent_set.remove(&removed);
@@ -171,7 +263,6 @@ impl State {
         Ok(())
     }
 
-    /// Atomically write the current state to disk.
     async fn flush(&self) -> Result<()> {
         let snapshot = {
             let inner = self.inner.read().await;
@@ -186,9 +277,6 @@ impl State {
     }
 }
 
-/// Write `bytes` to `path` atomically by writing to a sibling temp file and
-/// renaming. Falls back to a non-atomic write if rename fails (e.g. on
-/// cross-device temp dirs).
 async fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -198,7 +286,6 @@ async fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, bytes).await?;
     if let Err(e) = fs::rename(&tmp, path).await {
-        // Fallback: best-effort direct write.
         warn!(error = %e, "Atomic rename failed, falling back to direct write.");
         fs::write(path, bytes).await?;
         let _ = fs::remove_file(&tmp).await;
@@ -221,12 +308,15 @@ mod tests {
         assert!(!state.add_subscriber(42).await.unwrap());
         assert_eq!(state.subscribers().await, vec![42]);
 
-        // Reload from disk.
         let reloaded = State::load(&path).await.unwrap();
         assert_eq!(reloaded.subscribers().await, vec![42]);
 
-        assert!(reloaded.remove_subscriber(42).await.unwrap());
+        assert!(reloaded.ban_user(42).await.unwrap());
+        assert!(reloaded.is_banned(42).await);
         assert!(reloaded.subscribers().await.is_empty());
+
+        assert!(reloaded.unban_user(42).await.unwrap());
+        assert!(!reloaded.is_banned(42).await);
 
         let _ = fs::remove_file(&path).await;
         let _ = fs::remove_dir(&dir).await;

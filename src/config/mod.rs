@@ -1,11 +1,7 @@
 //! Application configuration loaded from environment variables.
-//!
-//! Configuration is loaded once at startup from the process environment, with
-//! support for a local `.env` file via [`dotenvy`]. Defaults are reasonable
-//! for a local deployment so the user typically only needs to provide
-//! `TELEGRAM_BOT_TOKEN`.
 
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -15,9 +11,10 @@ pub struct Config {
     /// Telegram bot token issued by `@BotFather`.
     pub telegram_token: String,
 
-    /// Optional GitHub Personal Access Token. If provided, GitHub API
-    /// requests are authenticated, raising the rate limit from 60 to
-    /// 5000 requests/hour.
+    /// Telegram user/chat IDs allowed to run admin commands and exempt from rate limits.
+    pub admin_ids: HashSet<i64>,
+
+    /// Optional GitHub Personal Access Token.
     pub github_token: Option<String>,
 
     /// Interval between automatic digest runs.
@@ -32,18 +29,13 @@ pub struct Config {
     /// HTTP request timeout for outbound RSS / GitHub calls.
     pub http_timeout: Duration,
 
-    /// User-Agent header used in outbound HTTP requests. Some feeds reject
-    /// the default reqwest UA.
+    /// User-Agent header used in outbound HTTP requests.
     pub user_agent: String,
 }
 
 impl Config {
     /// Load configuration from the process environment.
-    ///
-    /// Reads `.env` from the current working directory if present (ignoring
-    /// failure). The only strictly required variable is `TELEGRAM_BOT_TOKEN`.
     pub fn from_env() -> Result<Self> {
-        // Best-effort load of .env; absent file is not an error.
         let _ = dotenvy::dotenv();
 
         let telegram_token = std::env::var("TELEGRAM_BOT_TOKEN").context(
@@ -53,6 +45,8 @@ impl Config {
         if telegram_token.trim().is_empty() {
             anyhow::bail!("TELEGRAM_BOT_TOKEN is empty");
         }
+
+        let admin_ids = parse_admin_ids("ADMIN_IDS")?;
 
         let github_token = std::env::var("GITHUB_TOKEN")
             .ok()
@@ -80,6 +74,7 @@ impl Config {
 
         Ok(Self {
             telegram_token,
+            admin_ids,
             github_token,
             schedule_interval,
             max_items_per_category,
@@ -88,6 +83,24 @@ impl Config {
             user_agent,
         })
     }
+}
+
+fn parse_admin_ids(key: &str) -> Result<HashSet<i64>> {
+    let mut ids = HashSet::new();
+    let Ok(raw) = std::env::var(key) else {
+        return Ok(ids);
+    };
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let id = trimmed
+            .parse::<i64>()
+            .with_context(|| format!("{key} contains an invalid integer ID: `{trimmed}`"))?;
+        ids.insert(id);
+    }
+    Ok(ids)
 }
 
 fn parse_env_u64(key: &str, default: u64) -> Result<u64> {
