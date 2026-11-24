@@ -62,6 +62,92 @@ pub const DEFAULT_FEEDS: &[FeedSource] = &[
     FeedSource { name: "Unit 42 (Palo Alto)", url: "https://unit42.paloaltonetworks.com/feed/" },  
     FeedSource { name: "Talos Intelligence", url: "https://blog.talosintelligence.com/rss/" },  
     FeedSource { name: "Graham Cluley", url: "https://grahamcluley.com/feed/" },
+    FeedSource {
+        name: "CISA Advisories",
+        url: "https://www.cisa.gov/cybersecurity-advisories/all.xml",
+    },
+    FeedSource {
+        name: "NVD Recent CVEs",
+        url: "https://nvd.nist.gov/pao/nist-rss-feeds/cybersecurity/rss.xml",
+    },
+    FeedSource {
+        name: "NIST Cybersecurity Insights",
+        url: "https://www.nist.gov/blogs/cybersecurity-insights/rss.xml",
+    },
+    FeedSource {
+        name: "CERT/CC Vulnerability Notes",
+        url: "https://www.kb.cert.org/vuls/atomfeed/",
+    },
+    FeedSource {
+        name: "INCIBE-CERT Avisos",
+        url: "https://www.incibe.es/incibe-cert/alerta-temprana/avisos/feed",
+    },
+
+    // --- Investigación de Vulnerabilidades y 0-Day (Labs) ---
+    FeedSource {
+        name: "Google Project Zero",
+        url: "https://googleprojectzero.blogspot.com/feeds/posts/default",
+    },
+    FeedSource {
+        name: "PortSwigger Research",
+        url: "https://portswigger.net/research/rss",
+    },
+    FeedSource {
+        name: "Trail of Bits",
+        url: "https://blog.trailofbits.com/feed/",
+    },
+    FeedSource {
+        name: "watchTowr Labs",
+        url: "https://labs.watchtowr.com/rss/",
+    },
+    FeedSource {
+        name: "Zero Day Initiative (ZDI)",
+        url: "https://www.zerodayinitiative.com/rss/published/",
+    },
+
+    // --- Threat Intelligence, DFIR y Análisis de Malware ---
+    FeedSource {
+        name: "Unit 42 (Palo Alto)",
+        url: "https://unit42.paloaltonetworks.com/category/threat-research/feed/",
+    },
+    FeedSource {
+        name: "Cisco Talos Intelligence",
+        url: "https://blog.talosintelligence.com/rss/",
+    },
+    FeedSource {
+        name: "Google Cloud Threat Intel (Mandiant)",
+        url: "https://cloudblog.withgoogle.com/topics/threat-intelligence/rss/",
+    },
+    FeedSource {
+        name: "Kaspersky Securelist",
+        url: "https://securelist.com/feed/",
+    },
+    FeedSource {
+        name: "SentinelLabs",
+        url: "https://www.sentinelone.com/labs/feed/",
+    },
+    FeedSource {
+        name: "SANS Internet Storm Center",
+        url: "https://isc.sans.edu/rssfeed.xml",
+    },
+    FeedSource {
+        name: "The DFIR Report",
+        url: "https://thedfirreport.com/feed/",
+    },
+
+    // --- Investigadores Independientes Reconocidos ---
+    FeedSource {
+        name: "Schneier on Security",
+        url: "https://www.schneier.com/feed/atom/",
+    },
+    FeedSource {
+        name: "Troy Hunt",
+        url: "https://www.troyhunt.com/rss/",
+    },
+    FeedSource {
+        name: "Tavis Ormandy",
+        url: "https://lock.cmpxchg8b.com/feed.xml",
+    },
 ];
 
 /// Aggregator that fetches all configured RSS feeds concurrently.

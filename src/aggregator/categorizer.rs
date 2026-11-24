@@ -39,6 +39,13 @@ const POC_KEYWORDS: &[&str] = &[
     "weaponized",
     "weaponised",
     "metasploit module",
+    "write-up", 
+    "writeup", 
+    "exploit chain", 
+    "nuclei template", 
+    "root cause analysis", 
+    "shellcode", 
+    "bypass",
 ];
 
 const VULN_KEYWORDS: &[&str] = &[
@@ -69,6 +76,18 @@ const VULN_KEYWORDS: &[&str] = &[
     "high severity",
     "critical severity",
     "cvss",
+    "heap overflow", 
+    "out-of-bounds", 
+    "oob", 
+    "type confusion", 
+    "integer overflow", 
+    "memory corruption", 
+    "authentication bypass", 
+    "auth bypass", 
+    "arbitrary code execution", 
+    "sandbox escape", 
+    "kev", 
+    "known exploited",
 ];
 
 const ATTACK_KEYWORDS: &[&str] = &[
@@ -126,6 +145,21 @@ const IOC_KEYWORDS: &[&str] = &[
     "mitre att&ck",
     "att&ck",
     "indicators",
+    "sigma rule", 
+    "sigma rules", 
+    "reverse engineering", 
+    "disassembly", 
+    "cobalt strike", 
+    "beacon", 
+    "dropper", 
+    "loader", 
+    "backdoor", 
+    "rootkit", 
+    "stix", 
+    "misp", 
+    "dfir", 
+    "lateral movement", 
+    "persistence",
 ];
 
 /// Categorise a single [`NewsItem`] without taking ownership.
